@@ -871,3 +871,426 @@ def test_settlement_failure_no_side_effects(client):
     assert r.status_code == 201
     actions = [i["action"] for i in client.get("/api/audit").json()["items"]]
     assert actions.count("settlement.created") == 1
+
+
+# ------------------------------------------------------------------ 拒收复投
+def rejected_payload(**kw):
+    base = {
+        "batch_no": "B-REJ-001",
+        "region": "default",
+        "weight_kg": 100,
+        "materials": [{"category": "其他", "contamination_kg": 50}],
+        "operator": "收货员甲",
+    }
+    base.update(kw)
+    return base
+
+
+def create_rejected(client, **kw):
+    r = client.post("/api/assessments", json=rejected_payload(**kw))
+    assert r.status_code == 201, r.text
+    d = r.json()
+    assert d["conclusion"] == "拒收"
+    return d
+
+
+def resub_payload(**kw):
+    base = {
+        "batch_no": "B-RESUB-001",
+        "weight_kg": 100,
+        "materials": [{"category": "PET", "contamination_kg": 1}],
+        "operator": "返工员乙",
+    }
+    base.update(kw)
+    return base
+
+
+def do_resub(client, aid, **kw):
+    return client.post(f"/api/assessments/{aid}/resubmissions",
+                       json=resub_payload(**kw))
+
+
+def test_resubmission_independent_assessment_ok(client):
+    a0 = create_rejected(client)
+    r = do_resub(client, a0["id"])
+    assert r.status_code == 201, r.text
+    a1 = r.json()
+    # 独立判定单：新单号、新批次、新修订链（v1，root 指向自身）
+    assert a1["id"] != a0["id"]
+    assert a1["batch_no"] == "B-RESUB-001"
+    assert a1["version"] == 1
+    assert a1["root_id"] == a1["id"]
+    assert a1["parent_id"] is None
+    assert a1["is_current"] is True
+    # 区域沿用来源单；按提交时该区域启用规则（v1.0）判定
+    assert a1["region"] == "default"
+    assert a1["rule_version"] == "v1.0"
+    # 1kg/100kg → A 级合格，免扣费
+    assert a1["level"]["code"] == "A"
+    assert a1["conclusion"] == "合格接收"
+    assert a1["total_fee"] == 0
+    # 复投谱系字段：第 1 轮，来源单号与来源链均指向原拒收单
+    assert a1["resub_round"] == 1
+    assert a1["resub_root_id"] == a0["id"]
+    assert a1["resub_parent_id"] == a0["id"]
+    assert a1["resub_source_chain_id"] == a0["id"]
+    assert any("第 1 轮复投" in e and a0["id"] in e for e in a1["evidence"])
+    assert any("复投操作者：返工员乙" in e for e in a1["evidence"])
+
+
+def test_resubmission_uses_active_rule_at_submission(client):
+    a0 = create_rejected(client)  # 出具时启用 v1.0
+    # 提交复投前切换到 v1.1：复投单按提交时启用规则出具
+    assert client.post("/api/rules/default/activate",
+                       json={"version": "v1.1"}).status_code == 200
+    r = do_resub(client, a0["id"],
+                 materials=[{"category": "PET", "contamination_kg": 3}])
+    assert r.status_code == 201
+    a1 = r.json()
+    assert a1["rule_version"] == "v1.1"          # 3kg × 1.5 × 1.0 = 4.5
+    assert a1["total_fee"] == 4.5
+    # 旧判定单保持原样
+    old = client.get(f"/api/assessments/{a0['id']}").json()
+    assert old["rule_version"] == "v1.0"
+    assert old["conclusion"] == "拒收"
+    assert old["resub_round"] is None
+
+
+def test_resubmission_old_settlement_unchanged(client):
+    a0 = create_rejected(client)
+    # 原拒收链已结算（50kg × 1.5 × 1.5 = 112.5）
+    s0 = settle(client, [a0["id"]], request_id="REQ-OLD").json()
+    assert s0["total_delta"] == 112.5
+    # 返工复投合格
+    r = do_resub(client, a0["id"])
+    assert r.status_code == 201
+    a1 = r.json()
+    # 新链独立结算（扣费 0，不与原链差额挂钩）
+    s1 = settle(client, [a1["id"]], request_id="REQ-NEW").json()
+    assert s1["items"][0]["root_id"] == a1["id"]
+    assert s1["items"][0]["prev_settled_id"] is None
+    assert s1["total_delta"] == 0
+    # 旧结算单保持原样
+    old = client.get(f"/api/settlements/{s0['id']}").json()
+    assert old["total_delta"] == 112.5
+    assert old["items"][0]["assessment_id"] == a0["id"]
+
+
+def test_resubmission_audit_trail(client):
+    a0 = create_rejected(client)
+    assert do_resub(client, a0["id"]).status_code == 201
+    items = client.get("/api/audit",
+                       params={"entity": "assessment"}).json()["items"]
+    rec = [i for i in items if i["action"] == "assessment.resubmitted"]
+    assert len(rec) == 1
+    import json as _json
+    detail = _json.loads(rec[0]["detail"])
+    assert rec[0]["actor"] == "返工员乙"
+    assert detail["source_assessment_id"] == a0["id"]
+    assert detail["source_chain_id"] == a0["id"]
+    assert detail["resub_root_id"] == a0["id"]
+    assert detail["resub_round"] == 1
+    assert detail["batch_no"] == "B-RESUB-001"
+    assert detail["region"] == "default"
+    assert detail["conclusion"] == "合格接收"
+
+
+def test_resubmission_only_from_rejected_tail(client):
+    # 合格（非拒收）判定单不能复投
+    ok = create_one(client)
+    assert ok["conclusion"] == "降级接收"
+    r = do_resub(client, ok["id"])
+    assert r.status_code == 409
+    assert "拒收" in r.json()["errors"][0]["message"]
+    actions = [i["action"] for i in client.get("/api/audit").json()["items"]]
+    assert "assessment.resubmitted" not in actions
+
+
+def test_resubmission_rejected_again_can_continue_next_round(client):
+    a0 = create_rejected(client)
+    # 第 1 轮复投仍被拒收
+    r = do_resub(client, a0["id"], batch_no="B-RESUB-001",
+                 materials=[{"category": "其他", "contamination_kg": 40}])
+    assert r.status_code == 201
+    a1 = r.json()
+    assert a1["conclusion"] == "拒收"
+    assert a1["resub_round"] == 1
+    # 同一区域的新批次编号不得与已有原单批次编号重复
+    r = do_resub(client, a1["id"], batch_no=rejected_payload()["batch_no"])
+    assert r.status_code == 409
+    assert "batch_no" in fields(r)
+    # 也不得与第一轮复投单批次编号重复
+    r = do_resub(client, a1["id"], batch_no="B-RESUB-001")
+    assert r.status_code == 409
+    assert "batch_no" in fields(r)
+    # 换新批次编号可继续第 2 轮；返工后合格
+    r = do_resub(client, a1["id"], batch_no="B-RESUB-002",
+                 materials=[{"category": "PET", "contamination_kg": 1}])
+    assert r.status_code == 201
+    a2 = r.json()
+    assert a2["resub_round"] == 2
+    assert a2["resub_root_id"] == a0["id"]
+    assert a2["resub_parent_id"] == a1["id"]
+    assert a2["resub_source_chain_id"] == a1["id"]
+    assert a2["root_id"] == a2["id"]
+    assert a2["conclusion"] == "合格接收"
+
+
+def test_resubmission_one_direct_per_rejected_chain(client):
+    a0 = create_rejected(client)
+    assert do_resub(client, a0["id"], batch_no="B-R1").status_code == 201
+    # 对同一被拒收链再次直接复投：拒绝（每条链最多一次）
+    r = do_resub(client, a0["id"], batch_no="B-R2")
+    assert r.status_code == 409
+    assert "最多一次直接复投" in r.json()["errors"][0]["message"]
+    # 只有一张复投单、一次审计
+    items = client.get("/api/assessments").json()["items"]
+    assert sum(1 for i in items if i.get("resub_round") == 1) == 1
+    actions = [i["action"] for i in client.get("/api/audit").json()["items"]]
+    assert actions.count("assessment.resubmitted") == 1
+
+
+def test_resubmission_source_revised_not_tail_conflict(client):
+    a0 = create_rejected(client)
+    # 来源单被修订，链尾仍是拒收：旧号不能复投（不是链尾）
+    a0v2 = client.post(f"/api/assessments/{a0['id']}/revisions",
+                       json=revise_payload(a0["id"], weight_kg=100,
+                                           materials=[{"category": "其他",
+                                                       "contamination_kg": 30}])
+                       ).json()
+    assert a0v2["conclusion"] == "拒收"
+    r = do_resub(client, a0["id"], batch_no="B-R1")
+    assert r.status_code == 409
+    assert "链尾" in r.json()["errors"][0]["message"]
+    assert a0v2["id"] in r.json()["errors"][0]["message"]
+    # 凭拒收链尾可正常复投
+    r = do_resub(client, a0v2["id"], batch_no="B-R1")
+    assert r.status_code == 201
+    a1 = r.json()
+    assert a1["resub_parent_id"] == a0v2["id"]
+    assert a1["resub_source_chain_id"] == a0["id"]  # 来源链 root
+
+
+def test_resubmission_source_tail_revised_to_accepted(client):
+    a0 = create_rejected(client)
+    # 来源链修订为合格：已不再拒收，不能复投
+    a0v2 = client.post(f"/api/assessments/{a0['id']}/revisions",
+                       json=revise_payload(a0["id"])).json()
+    assert a0v2["conclusion"] == "合格接收"
+    r = do_resub(client, a0v2["id"], batch_no="B-R1")
+    assert r.status_code == 409
+    assert "拒收" in r.json()["errors"][0]["message"]
+    assert len(client.get("/api/assessments").json()["items"]) == 2
+
+
+def test_resubmission_not_found(client):
+    r = client.post("/api/assessments/NOPE/resubmissions", json=resub_payload())
+    assert r.status_code == 404
+    assert "id" in fields(r)
+    r = client.get("/api/assessments/NOPE/resubmissions")
+    assert r.status_code == 404
+
+
+def test_resubmission_validation_failure_no_side_effects(client):
+    a0 = create_rejected(client)
+    before_audit = len(client.get("/api/audit").json()["items"])
+    r = do_resub(client, a0["id"], weight_kg=-1,
+                 materials=[{"category": "锂电池", "contamination_kg": 1}])
+    assert r.status_code == 422
+    assert "weight_kg" in fields(r)
+    assert "materials[0].category" in fields(r)
+    # 整笔拒绝：不写判定、不写审计、来源链未被占用（可重新提交）
+    items = client.get("/api/assessments").json()["items"]
+    assert len(items) == 1
+    assert len(client.get("/api/audit").json()["items"]) == before_audit
+    r = do_resub(client, a0["id"], batch_no="B-RETRY")
+    assert r.status_code == 201
+
+
+def test_resubmission_missing_required_fields(client):
+    a0 = create_rejected(client)
+    for body in (
+        {"weight_kg": 100,
+         "materials": [{"category": "PET", "contamination_kg": 1}],
+         "operator": "x"},                       # 缺 batch_no
+        {"batch_no": "B-X", "weight_kg": 100,
+         "materials": [{"category": "PET", "contamination_kg": 1}]},  # 缺 operator
+        {"batch_no": "B-X", "weight_kg": 100, "materials": [],
+         "operator": "x"},                       # 空物料
+    ):
+        r = client.post(f"/api/assessments/{a0['id']}/resubmissions", json=body)
+        assert r.status_code == 422, body
+    assert len(client.get("/api/assessments").json()["items"]) == 1
+
+
+def test_resubmission_batch_conflict_scoped_to_region(client):
+    a0 = create_rejected(client)  # default / B-REJ-001
+    # 华东区域允许相同批次编号（编号冲突按区域判定）
+    hd = client.post("/api/assessments", json=make_payload(
+        batch_no="B-HD-1", region="华东",
+        materials=[{"category": "厨余", "contamination_kg": 10}])).json()
+    assert hd["conclusion"] == "拒收"
+    r = do_resub(client, hd["id"], batch_no="B-REJ-001",
+                 materials=[{"category": "厨余", "contamination_kg": 1}])
+    assert r.status_code == 201
+    assert r.json()["region"] == "华东"
+    # default 区域仍不允许 B-REJ-001
+    r = do_resub(client, a0["id"], batch_no="B-REJ-001")
+    assert r.status_code == 409
+
+
+def test_resubmission_concurrent_single_winner(client):
+    import concurrent.futures
+
+    a0 = create_rejected(client)
+
+    def fire(i):
+        return do_resub(client, a0["id"], batch_no=f"B-C{i}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = [f.result() for f in
+                   [pool.submit(fire, i) for i in range(6)]]
+    codes = sorted(r.status_code for r in results)
+    assert codes.count(201) == 1
+    assert codes.count(409) == 5
+    items = client.get("/api/assessments").json()["items"]
+    assert sum(1 for i in items if i.get("resub_round")) == 1
+    actions = [i["action"] for i in client.get("/api/audit").json()["items"]]
+    assert actions.count("assessment.resubmitted") == 1
+
+
+def test_resubmission_lineage_query_full_and_latest(client):
+    a0 = create_rejected(client)
+    a1 = do_resub(client, a0["id"], batch_no="B-R1",
+                  materials=[{"category": "其他", "contamination_kg": 40}]).json()
+    assert a1["conclusion"] == "拒收"
+    a2 = do_resub(client, a1["id"], batch_no="B-R2",
+                  materials=[{"category": "PET", "contamination_kg": 1}]).json()
+    assert a2["conclusion"] == "合格接收"
+
+    # 从任一轮（含原拒收链）查询：完整谱系与最新轮一致
+    for aid in (a0["id"], a1["id"], a2["id"]):
+        d = client.get(f"/api/assessments/{aid}/resubmissions").json()
+        assert d["lineage_root_id"] == a0["id"]
+        assert d["round_count"] == 3
+        assert d["latest_round"] == 2
+        assert d["current_id"] == a2["id"]
+        assert [r["round"] for r in d["rounds"]] == [0, 1, 2]
+        assert d["current"]["id"] == a2["id"]
+        assert d["current"]["conclusion"] == "合格接收"
+
+    r0, r1, r2 = [client.get(f"/api/assessments/{a0['id']}/resubmissions")
+                  .json()["rounds"][i] for i in range(3)]
+    # 第 0 轮：原拒收来料链
+    assert r0["round"] == 0
+    assert r0["chain_root_id"] == a0["id"]
+    assert r0["first_assessment_id"] == a0["id"]
+    assert r0["chain_tail_id"] == a0["id"]
+    assert r0["source_assessment_id"] is None
+    assert r0["batch_no"] == "B-REJ-001"
+    assert r0["conclusion"] == "拒收"
+    # 第 1 轮：独立复投链，来源指向第 0 轮链尾
+    assert r1["round"] == 1
+    assert r1["chain_root_id"] == a1["id"]
+    assert r1["source_assessment_id"] == a0["id"]
+    assert r1["resub_root_id"] == a0["id"]
+    assert r1["batch_no"] == "B-R1"
+    assert r1["conclusion"] == "拒收"
+    # 第 2 轮：来源指向第 1 轮链尾
+    assert r2["round"] == 2
+    assert r2["chain_root_id"] == a2["id"]
+    assert r2["source_assessment_id"] == a1["id"]
+    assert r2["conclusion"] == "合格接收"
+
+
+def test_resubmission_lineage_tracks_revisions(client):
+    a0 = create_rejected(client)
+    a1 = do_resub(client, a0["id"], batch_no="B-R1",
+                  materials=[{"category": "PET", "contamination_kg": 1}]).json()
+    # 修订复投链（复检后仍合格）：谱系字段随修订传播，最新轮指向新链尾
+    a1v2 = client.post(f"/api/assessments/{a1['id']}/revisions",
+                       json=revise_payload(a1["id"], weight_kg=90,
+                                           materials=[{"category": "PET",
+                                                       "contamination_kg": 0.5}])
+                       ).json()
+    assert a1v2["resub_round"] == 1
+    assert a1v2["resub_root_id"] == a0["id"]
+    d = client.get(f"/api/assessments/{a0['id']}/resubmissions").json()
+    assert d["latest_round"] == 1
+    assert d["current_id"] == a1v2["id"]
+    r1 = d["rounds"][1]
+    assert r1["chain_tail_id"] == a1v2["id"]
+    assert r1["first_assessment_id"] == a1["id"]
+    assert r1["chain_versions"] == 2
+    assert r1["tail_version"] == 2
+    # 修订链查询中复投字段同样可见
+    chain = client.get(f"/api/assessments/{a1v2['id']}/revisions").json()
+    for item in chain["items"]:
+        assert item["resub_round"] == 1
+        assert item["resub_root_id"] == a0["id"]
+
+
+def test_resubmission_single_round_lineage_for_plain_assessment(client):
+    a0 = create_one(client)  # 普通判定（降级接收），无复投
+    d = client.get(f"/api/assessments/{a0['id']}/resubmissions").json()
+    assert d["lineage_root_id"] == a0["id"]
+    assert d["round_count"] == 1
+    assert d["latest_round"] == 0
+    assert d["current_id"] == a0["id"]
+    assert d["rounds"][0]["round"] == 0
+    assert d["rounds"][0]["chain_tail_id"] == a0["id"]
+
+
+def test_resubmission_fields_in_list_and_csv(client):
+    a0 = create_rejected(client)
+    a1 = do_resub(client, a0["id"], batch_no="B-R1").json()
+    items = {i["id"]: i for i in
+             client.get("/api/assessments").json()["items"]}
+    for f in ("resub_root_id", "resub_parent_id", "resub_round",
+              "resub_source_chain_id"):
+        assert f in items[a0["id"]]
+        assert f in items[a1["id"]]
+    assert items[a0["id"]]["resub_round"] is None
+    # current 过滤：两条独立链的链尾都在
+    current = client.get("/api/assessments",
+                         params={"current": "true"}).json()["items"]
+    assert len(current) == 2
+    # CSV 追加复投列，既有列保持不变
+    r = client.get("/api/export/assessments.csv")
+    header = r.text.splitlines()[0]
+    for col in ("resub_root_id", "resub_parent_id", "resub_round",
+                "resub_source_chain_id"):
+        assert col in header
+    assert "B-R1" in r.text
+
+
+def test_resubmission_rejected_chain_can_settle_independently(client):
+    # 拒收单有扣费（50kg 其他 × 1.5 × 1.5 = 112.5）；复投链与原链各自结算
+    a0 = create_rejected(client)
+    a1 = do_resub(client, a0["id"], batch_no="B-R1",
+                  materials=[{"category": "其他", "contamination_kg": 20}]).json()
+    assert a1["conclusion"] == "拒收"
+    s0 = settle(client, [a0["id"]], request_id="REQ-0").json()
+    s1 = settle(client, [a1["id"]], request_id="REQ-1").json()
+    assert s0["total_delta"] == 112.5
+    # 20kg × 1.5 × 1.5 = 45；复投链首次结算按全额，不引用原链
+    assert s1["total_delta"] == 45
+    assert s1["items"][0]["root_id"] == a1["id"]
+    assert s1["items"][0]["prev_settled_id"] is None
+
+
+def test_resubmission_failure_holds_no_state(client):
+    a0 = create_rejected(client)
+    before_audit = len(client.get("/api/audit").json()["items"])
+    # 各类失败均不产生单据与审计，且未占用“一次直接复投”的名额
+    do_resub(client, "NOPE", batch_no="B-X")                 # 404
+    ok = create_one(client, batch_no="B-OK")
+    do_resub(client, ok["id"], batch_no="B-X")               # 409 非拒收
+    do_resub(client, a0["id"], batch_no=rejected_payload()["batch_no"])  # 409 编号冲突
+    do_resub(client, a0["id"], weight_kg=0,                  # 422 校验失败
+             materials=[{"category": "PET", "contamination_kg": 1}])
+    assert len(client.get("/api/audit").json()["items"]) == before_audit + 1
+    items = client.get("/api/assessments").json()["items"]
+    assert all(i.get("resub_round") is None for i in items)
+    # 名额未被占用：可正常复投成功
+    assert do_resub(client, a0["id"], batch_no="B-AFTER").status_code == 201

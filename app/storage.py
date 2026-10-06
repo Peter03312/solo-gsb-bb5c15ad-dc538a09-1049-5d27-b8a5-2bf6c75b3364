@@ -44,6 +44,10 @@ CREATE TABLE IF NOT EXISTS assessments (
     parent_id              TEXT,
     version                INTEGER NOT NULL DEFAULT 1,
     revision_reason        TEXT,
+    resub_root_id          TEXT,
+    resub_parent_id        TEXT,
+    resub_round            INTEGER,
+    resub_source_chain_id  TEXT,
     created_at             TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_assessments_batch  ON assessments(batch_no);
@@ -113,11 +117,13 @@ class Store:
             self._migrate(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_assessments_root"
                          " ON assessments(root_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_assessments_resub_root"
+                         " ON assessments(resub_root_id)")
         self._seed_rules()
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
-        """为旧版数据库补齐修订链相关列（新列对历史单据取默认值）。"""
+        """为旧版数据库补齐修订链与复投谱系相关列（新列对历史单据取默认值）。"""
         cols = {r[1] for r in conn.execute("PRAGMA table_info(assessments)")}
         for col, ddl in (
             ("root_id", "ALTER TABLE assessments ADD COLUMN root_id TEXT"),
@@ -126,9 +132,23 @@ class Store:
                         " INTEGER NOT NULL DEFAULT 1"),
             ("revision_reason",
              "ALTER TABLE assessments ADD COLUMN revision_reason TEXT"),
+            ("resub_root_id",
+             "ALTER TABLE assessments ADD COLUMN resub_root_id TEXT"),
+            ("resub_parent_id",
+             "ALTER TABLE assessments ADD COLUMN resub_parent_id TEXT"),
+            ("resub_round",
+             "ALTER TABLE assessments ADD COLUMN resub_round INTEGER"),
+            ("resub_source_chain_id",
+             "ALTER TABLE assessments ADD COLUMN resub_source_chain_id TEXT"),
         ):
             if col not in cols:
                 conn.execute(ddl)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_assessments_resub_source_chain"
+            " ON assessments(resub_source_chain_id)"
+            " WHERE resub_source_chain_id IS NOT NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_assessments_resub_root"
+                     " ON assessments(resub_root_id)")
 
     # ------------------------------------------------------------------ 基础
     def _conn(self) -> sqlite3.Connection:
@@ -319,7 +339,7 @@ class Store:
         aid = "A" + uuid.uuid4().hex[:10].upper()
         with self._locked_conn() as conn:
             tail = conn.execute(
-                "SELECT id, version FROM assessments"
+                "SELECT * FROM assessments"
                 " WHERE root_id=? OR id=? ORDER BY version DESC LIMIT 1",
                 (root_id, root_id),
             ).fetchone()
@@ -332,8 +352,10 @@ class Store:
                 " total_contamination_kg, contamination_ratio, level_code,"
                 " level_name, conclusion, total_fee, currency, rule_version,"
                 " rule_snapshot, request_json, result_json, operator,"
-                " root_id, parent_id, version, revision_reason, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " root_id, parent_id, version, revision_reason,"
+                " resub_root_id, resub_parent_id, resub_round,"
+                " resub_source_chain_id, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     aid, payload["batch_no"], payload["region"], payload["weight_kg"],
                     result["total_contamination_kg"], result["contamination_ratio"],
@@ -344,9 +366,83 @@ class Store:
                     json.dumps(result, ensure_ascii=False),
                     payload.get("operator"),
                     root_id, base_id, tail["version"] + 1,
-                    payload.get("reason"), _now(),
+                    payload.get("reason"),
+                    tail["resub_root_id"], tail["resub_parent_id"],
+                    tail["resub_round"], None, _now(),
                 ),
             )
+        return self.get_assessment(aid), None
+
+    def create_resubmission(self, source_id: str, payload: dict, rule: dict,
+                            result: dict
+                            ) -> tuple[dict | None, str | None]:
+        """拒收来料返工后重新进场：以来源区域提交时的启用规则出具独立判定单。
+
+        单个持锁事务内完成全部核对并插入复投单：
+        - 来源单号必须存在、必须是其修订链的链尾、链尾结论仍为“拒收”；
+        - 同一来源链最多一次直接复投（唯一索引兜底并发重复复投）；
+        - 同一区域的新批次编号不得与任何已有单据的批次编号重复。
+        任一条件不满足都不写入判定或审计。
+        返回 (新单, None)；失败返回 (None, 原因码)，原因码：
+        'not_found' | 'not_tail' | 'not_rejected' | 'already_resubmitted'
+        | 'batch_conflict'。"""
+        aid = "A" + uuid.uuid4().hex[:10].upper()
+        with self._locked_conn() as conn:
+            src = conn.execute(
+                "SELECT * FROM assessments WHERE id=?", (source_id,)).fetchone()
+            if not src:
+                return None, "not_found"
+            source_chain_root = src["root_id"] or src["id"]
+            tail = conn.execute(
+                "SELECT * FROM assessments WHERE root_id=? OR id=?"
+                " ORDER BY version DESC, created_at DESC, id DESC LIMIT 1",
+                (source_chain_root, source_chain_root)).fetchone()
+            if tail is None or tail["id"] != source_id:
+                return None, "not_tail"
+            if src["conclusion"] != "拒收":
+                return None, "not_rejected"
+            dup_chain = conn.execute(
+                "SELECT 1 FROM assessments WHERE resub_source_chain_id=? LIMIT 1",
+                (source_chain_root,)).fetchone()
+            if dup_chain:
+                return None, "already_resubmitted"
+            dup_batch = conn.execute(
+                "SELECT id FROM assessments WHERE region=? AND batch_no=? LIMIT 1",
+                (src["region"], payload["batch_no"])).fetchone()
+            if dup_batch:
+                return None, "batch_conflict"
+            resub_root = src["resub_root_id"] or source_chain_root
+            resub_round = (src["resub_round"] or 0) + 1
+            try:
+                conn.execute(
+                    "INSERT INTO assessments (id, batch_no, region, weight_kg,"
+                    " total_contamination_kg, contamination_ratio, level_code,"
+                    " level_name, conclusion, total_fee, currency, rule_version,"
+                    " rule_snapshot, request_json, result_json, operator,"
+                    " root_id, version,"
+                    " resub_root_id, resub_parent_id, resub_round,"
+                    " resub_source_chain_id, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        aid, payload["batch_no"], src["region"],
+                        payload["weight_kg"],
+                        result["total_contamination_kg"],
+                        result["contamination_ratio"],
+                        result["level"]["code"], result["level"]["name"],
+                        result["conclusion"], result["total_fee"],
+                        result["currency"], rule["version"],
+                        json.dumps(rule, ensure_ascii=False),
+                        json.dumps(payload, ensure_ascii=False),
+                        json.dumps(result, ensure_ascii=False),
+                        payload.get("operator"),
+                        aid, 1,
+                        resub_root, source_id, resub_round,
+                        source_chain_root, _now(),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # 并发复投争用同一来源链：唯一索引拒绝其中之一
+                return None, "already_resubmitted"
         return self.get_assessment(aid), None
 
     def get_assessment(self, aid: str) -> dict | None:
@@ -384,6 +480,10 @@ class Store:
             "version": row["version"],
             "is_current": is_current,
             "revision_reason": row["revision_reason"],
+            "resub_root_id": row["resub_root_id"],
+            "resub_parent_id": row["resub_parent_id"],
+            "resub_round": row["resub_round"],
+            "resub_source_chain_id": row["resub_source_chain_id"],
         }
 
     def list_assessments(self, region: str | None = None, level: str | None = None,
@@ -393,6 +493,8 @@ class Store:
                " contamination_ratio, level_code, level_name, conclusion, total_fee,"
                " currency, rule_version, operator, created_at,"
                " root_id, parent_id, version, revision_reason,"
+               " resub_root_id, resub_parent_id, resub_round,"
+               " resub_source_chain_id,"
                " NOT EXISTS(SELECT 1 FROM assessments c"
                "            WHERE c.parent_id = assessments.id) AS is_current"
                " FROM assessments")
@@ -418,6 +520,92 @@ class Store:
         return [{**dict(r),
                  "root_id": r["root_id"] or r["id"],
                  "is_current": bool(r["is_current"])} for r in rows]
+
+    def get_resub_lineage(self, aid: str) -> dict | None:
+        """按复投谱系内任意单号（含原拒收链）查询完整复投谱系与最新轮。
+
+        谱系为线性的“轮”序列：第 0 轮是最初被拒收的来料链，之后每轮是对
+        上一轮拒收链尾的一次复投（复投单自身是一条独立修订链）。
+        单号不存在时返回 None。"""
+        with self._locked_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM assessments WHERE id=?", (aid,)).fetchone()
+            if not row:
+                return None
+            lineage_root = row["resub_root_id"] or row["root_id"] or row["id"]
+
+            def chain_rows(root_id: str) -> list[sqlite3.Row]:
+                return conn.execute(
+                    "SELECT * FROM assessments WHERE root_id=? OR id=?"
+                    " ORDER BY version, created_at, id",
+                    (root_id, root_id)).fetchall()
+
+            def resub_of(source_chain_id: str):
+                return conn.execute(
+                    "SELECT * FROM assessments WHERE resub_source_chain_id=?"
+                    " LIMIT 1", (source_chain_id,)).fetchone()
+
+            rounds: list[dict] = []
+            # 第 0 轮：最初被拒收的来料修订链
+            first_rows = chain_rows(lineage_root)
+            rounds.append(self._resub_round(0, first_rows, None))
+            # 之后各轮按来源链逐跳串联（每条来源链至多一次直接复投）
+            cursor = resub_of(lineage_root)
+            while cursor:
+                rows_r = chain_rows(cursor["root_id"])
+                rounds.append(self._resub_round(cursor["resub_round"], rows_r,
+                                                cursor))
+                cursor = resub_of(cursor["root_id"])
+        current_round = rounds[-1]
+        return {
+            "lineage_root_id": lineage_root,
+            "round_count": len(rounds),
+            "latest_round": current_round["round"],
+            "current_id": current_round["chain_tail_id"],
+            "current": current_round["chain_tail"],
+            "rounds": rounds,
+        }
+
+    @staticmethod
+    def _resub_round(round_no: int, rows: list[sqlite3.Row],
+                     first: sqlite3.Row | None) -> dict:
+        """组装某一轮的谱系摘要（该轮的修订链 + 复投来源信息）。"""
+        tail = rows[-1]
+        first = first or rows[0]
+        return {
+            "round": round_no,
+            "chain_root_id": first["root_id"] or first["id"],
+            "first_assessment_id": first["id"],
+            "chain_tail_id": tail["id"],
+            "chain_versions": len(rows),
+            "is_current_tail": tail["id"] == first["id"],
+            "source_assessment_id": first["resub_parent_id"] if round_no else None,
+            "resub_root_id": first["resub_root_id"] if round_no else None,
+            "batch_no": first["batch_no"],
+            "region": first["region"],
+            "operator": first["operator"],
+            "created_at": first["created_at"],
+            "rule_version": first["rule_version"],
+            "tail_version": tail["version"],
+            "level_code": tail["level_code"],
+            "level_name": tail["level_name"],
+            "conclusion": tail["conclusion"],
+            "total_fee": tail["total_fee"],
+            "currency": tail["currency"],
+            "chain_tail": {
+                "id": tail["id"],
+                "version": tail["version"],
+                "batch_no": tail["batch_no"],
+                "region": tail["region"],
+                "rule_version": tail["rule_version"],
+                "level_code": tail["level_code"],
+                "level_name": tail["level_name"],
+                "conclusion": tail["conclusion"],
+                "total_fee": tail["total_fee"],
+                "currency": tail["currency"],
+                "is_current": True,
+            },
+        }
 
     # ---------------------------------------------------------------- 结算单
     def _fetch_settlement(self, conn: sqlite3.Connection, sid: str) -> dict | None:

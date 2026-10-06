@@ -9,6 +9,7 @@
 - **规则版本化**：规则按 `(区域, 版本)` 存储，每区域一个启用版本，可新增版本、切换启用版本；判定单出具时保存**规则快照**，规则更新不会改写历史结论
 - **判定修订**：发现已出具单据的称重或杂质录入有误时，凭原单号 + 所见最新单号提交复检重量与物料，系统沿用原单批次、区域与规则快照复算，生成关联前版的只读新版本；完整修订链可按编号追溯
 - **判定复核**：质检员可对已出具的判定单选择同区域另一规则版本做只读复核：以原单保存的批次重量与物料明细按目标版本重新校验、计算，返回原结论与目标等级、扣费明细与差异项；不写单据、不产生修订与审计
+- **拒收复投**：被拒收的来料返工后可重新进场。操作员凭当前有效（链尾）且结论为“拒收”的判定单提交新批次编号、复投重量、物料污染量与操作者；系统沿用来源区域，按提交时该区域的启用规则出具**独立判定单**，记录来源链与复投轮次，旧判定与已生成结算单保持原样。每条被拒收链最多一次直接复投；复投仍被拒收时可凭新链尾继续下一轮；从任一轮可查完整复投谱系与最新轮
 - **费用结算**：操作员提交区域、当前有效（链尾）单号列表与幂等请求号，系统核对单号区域、币种与修订链状态后，在同一事务内冻结各链本次应结金额（与该链上次已结算版本的扣费差额，可为负）、来源版本与合计，生成不可修改的结算单并留审计；同一请求号重试安全，同一链同一版本只会入账一次
 - **持久化与审计**：判定单、规则版本、结算单、审计日志存于 SQLite；判定创建、修订（含原因与操作者）、规则新增/切换、结算生成均留痕
 - **页面与 API**：简洁 Web 页面（`/`）+ REST API（交互文档 `/docs`）+ CSV 导出
@@ -55,6 +56,8 @@ pytest tests/ -q
 | GET | `/api/assessments/{id}` | 判定单详情（含扣费明细、证据与修订链信息） |
 | POST | `/api/assessments/{id}/revisions` | 修订判定单（沿用原单快照复算，生成新版本） |
 | GET | `/api/assessments/{id}/revisions` | 查询完整修订链与当前有效（链尾）结论 |
+| POST | `/api/assessments/{id}/resubmissions` | 拒收返工复投（沿用来源区域，按启用规则出具独立判定单） |
+| GET | `/api/assessments/{id}/resubmissions` | 查询完整复投谱系（各轮链）与最新轮 |
 | POST | `/api/assessments/{id}/review` | 复核判定单（按同区域目标规则版本重算对比，只读） |
 | POST | `/api/settlements` | 结算所选修订链当前版本扣费，生成可追溯结算单（幂等） |
 | GET | `/api/settlements` | 查询结算单列表（`region` / `limit` / `offset`） |
@@ -327,6 +330,98 @@ curl http://localhost:8000/api/settlements/S7E8F9A0B12
 单号不存在（`404`）、单号非链尾（`422`）、单号区域与请求区域不一致（`422`）、
 各链币种不一致（`422`）、同一链当前版本已结算（`409`）。
 
+### 9. 拒收返工复投（重新进场）
+
+被拒收的来料返工后，操作员凭**当前有效（链尾）且结论为“拒收”**的判定单，
+提交**新批次编号、复投重量、物料污染量与操作者**。系统沿用来源单的区域，
+按**提交时该区域的启用规则**出具一张独立判定单（新批次、新修订链，`v1`），
+记录来源单号、来源链与复投轮次；旧判定单与已生成结算单保持原样。
+
+```bash
+# 假设拒收单号为 AC001122334（结论“拒收”，区域 default）
+curl -X POST http://localhost:8000/api/assessments/AC001122334/resubmissions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batch_no": "B20261006-R1",
+    "weight_kg": 100,
+    "materials": [{"category": "PET", "contamination_kg": 1}],
+    "operator": "返工-赵六"
+  }'
+```
+
+响应 `201`：返回完整的独立判定单，并附带复投谱系字段；证据说明注明
+来源单号、轮次与“旧判定与已生成结算单保持原样”。
+
+```json
+{
+  "id": "AD556677889",
+  "batch_no": "B20261006-R1",
+  "region": "default",
+  "version": 1,
+  "root_id": "AD556677889",
+  "parent_id": null,
+  "conclusion": "合格接收",
+  "resub_round": 1,
+  "resub_root_id": "AC001122334",
+  "resub_parent_id": "AC001122334",
+  "resub_source_chain_id": "AC001122334",
+  "evidence": [
+    "本单为拒收返工后的第 1 轮复投，来源单号 AC001122334（区域沿用 default，按提交时启用规则 default/v1.0 独立判定；旧判定与已生成结算单保持原样）。",
+    "依据规则版本 default/v1.0 判定。"
+  ]
+}
+```
+
+**继续下一轮**：每条被拒收链最多一次**直接**复投。若复投单仍被拒收，
+可凭复投链尾继续下一轮（轮次递增、谱系根不变）；已合格的轮次不能再复投：
+
+```bash
+# 第 1 轮仍拒收（假设新单号 AD55...）→ 凭其链尾发起第 2 轮
+curl -X POST http://localhost:8000/api/assessments/AD556677889/resubmissions \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_no":"B20261006-R2","weight_kg":100,
+       "materials":[{"category":"PET","contamination_kg":0.5}],"operator":"返工-赵六"}'
+```
+
+**查询复投谱系**：从谱系内任意单号（含原拒收单、任一轮复投单及其修订版）
+均可查完整谱系与最新轮：
+
+```bash
+curl http://localhost:8000/api/assessments/AC001122334/resubmissions
+```
+
+```json
+{
+  "lineage_root_id": "AC001122334",
+  "round_count": 3,
+  "latest_round": 2,
+  "current_id": "AE99...",
+  "current": {"id": "AE99...", "version": 1, "conclusion": "合格接收"},
+  "rounds": [
+    {"round": 0, "chain_root_id": "AC001122334", "first_assessment_id": "AC001122334",
+     "chain_tail_id": "AC001122334", "source_assessment_id": null,
+     "batch_no": "B20261005-RJ", "conclusion": "拒收"},
+    {"round": 1, "chain_root_id": "AD556677889", "first_assessment_id": "AD556677889",
+     "chain_tail_id": "AD556677889", "source_assessment_id": "AC001122334",
+     "batch_no": "B20261006-R1", "conclusion": "拒收"},
+    {"round": 2, "chain_root_id": "AE99...", "first_assessment_id": "AE99...",
+     "chain_tail_id": "AE99...", "source_assessment_id": "AD556677889",
+     "batch_no": "B20261006-R2", "conclusion": "合格接收"}
+  ]
+}
+```
+
+每一轮是一条独立修订链：若该轮被修订，`chain_tail_id` / `chain_versions`
+会反映其链尾（“最新轮”即最新轮次修订链的当前链尾）；普通判定单（从未复投）
+查询时返回仅含第 0 轮的单轮谱系。
+
+**拒绝情形**（整笔拒绝，不写判定或审计）：来源单号不存在（`404`）、
+来源单号不是链尾（`409`，响应中给出当前链尾）、链尾结论已不是“拒收”
+（`409`）、该来源链已直接复投过（`409`）、同一区域新批次编号与已有
+原单批次编号重复（`409`，冲突按区域判定）、并发重复复投（`409`，仅一个
+请求成功）；复投重量/物料不通过现有字段校验时返回 `422`。复投单自身是
+独立判定链，可照常修订与结算；复投不影响来源链已生成的结算单。
+
 ## 费用结算设计
 
 - 结算单（`settlements`）与结算明细（`settlement_items`）只增不改：
@@ -347,6 +442,35 @@ curl http://localhost:8000/api/settlements/S7E8F9A0B12
 - 结算成功写入审计 `settlement.created`（操作者、请求号、区域、币种、
   合计与各链差额）；任何校验失败、冲突都不产生结算单与审计记录，
   且失败不占用请求号，修正后可重新提交。
+
+## 拒收复投设计
+
+- 复投是**出具一张独立判定单**：新批次编号、新修订链（`v1`，`root_id`
+  指向自身），区域沿用来源单，规则取**提交时**该区域的启用规则版本；
+  不沿用来源单的规则快照（与修订不同），区域规则切换会作用于复投判定。
+- 谱系以四个字段记录在判定单上（普通判定均为 `NULL`，不影响既有行为）：
+  - `resub_round`：复投轮次，来源链为第 0 轮，首次复投为 1，逐轮 +1；
+  - `resub_parent_id`：本复投单的直接来源单号（提交时的拒收链尾）；
+  - `resub_root_id`：谱系根（最初被拒收来料链的 `root_id`），全谱系一致；
+  - `resub_source_chain_id`：本复投单来源链的 `root_id`，仅复投链首单有值。
+- **每条被拒收链最多一次直接复投**：`resub_source_chain_id` 上的部分唯一
+  索引（`WHERE ... IS NOT NULL`）在数据库层兜底；并发争用同一来源链时
+  只有一个请求成功（`201`），其余收到 `409`，且不写判定或审计。
+- 复投仍被拒收时可继续下一轮：新一轮的来源是上一轮复投链的拒收链尾；
+  已合格的轮次不可再复投。同一区域新批次编号不得与任何已有单据（含原单、
+  复投单）的批次编号重复，编号冲突按区域分别判定。
+- 复投链可照常**修订**：修订版沿用该轮规则快照复算，并继承
+  `resub_round` / `resub_root_id` / `resub_parent_id`（`resub_source_chain_id`
+  仅链首单保留，保证唯一约束语义）；因此“最新轮”始终指向最新轮次链的链尾。
+- 旧判定单与已生成结算单永不改变；复投链是独立链，按普通规则独立结算，
+  不与来源链做扣费差额。
+- 全部核对（来源存在、为链尾、仍为拒收、未复投过、批次编号不冲突）与
+  插入在**单个持锁事务**内完成；任一失败整笔拒绝、不写判定或审计，
+  成功时写入审计 `assessment.resubmitted`（操作者、来源单号/链、轮次、
+  新批次与结论）。
+- `GET /api/assessments/{id}/resubmissions` 从谱系内任意单号返回完整谱系
+  （按轮组织的各条修订链）与最新轮；详情、列表、修订链与 CSV 在既有字段
+  之后追加四个复投字段，既有字段含义与行为不变。
 
 ## 规则版本化设计
 
@@ -386,9 +510,9 @@ curl http://localhost:8000/api/settlements/S7E8F9A0B12
 app/
   main.py            # FastAPI 入口：API 路由、错误处理、CSV 导出
   rules.py           # 规则引擎：种子规则、提交校验、判定计算
-  storage.py         # SQLite 持久化：判定单（含修订链）/ 规则版本 / 结算单 / 审计日志
+  storage.py         # SQLite 持久化：判定单（含修订链/复投谱系）/ 规则版本 / 结算单 / 审计日志
   static/index.html  # 单文件 Web 页面
-tests/test_api.py    # 53 个接口、版本化、修订、复核与结算行为测试
+tests/test_api.py    # 73 个接口、版本化、修订、复核、结算与拒收复投行为测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

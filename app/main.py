@@ -49,6 +49,15 @@ class RevisionIn(BaseModel):
     operator: str = Field(min_length=1, max_length=32)
 
 
+class ResubmissionIn(BaseModel):
+    """拒收返工复投：新批次编号、复投重量、物料污染量与操作者；
+    来源区域沿用来源单，规则取提交时该区域的启用版本。"""
+    batch_no: str = Field(min_length=1, max_length=64)
+    weight_kg: float
+    materials: list[MaterialItem] = Field(min_length=1)
+    operator: str = Field(min_length=1, max_length=32)
+
+
 class RuleIn(BaseModel):
     region: str = Field(min_length=1, max_length=32)
     version: str = Field(min_length=1, max_length=32)
@@ -280,10 +289,115 @@ def list_revisions(aid: str, store: Store = Depends(get_store)):
         "rule_version": r["rule_version"],
         "operator": r["operator"],
         "revision_reason": r["revision_reason"],
+        "resub_round": r["resub_round"],
+        "resub_parent_id": r["resub_parent_id"],
+        "resub_root_id": r["resub_root_id"],
+        "resub_source_chain_id": r["resub_source_chain_id"],
         "created_at": r["created_at"],
     } for r in chain]
     return {"root_id": chain[0]["root_id"] or chain[0]["id"],
             "current_id": tail_id, "current": items[-1], "items": items}
+
+
+# ---------------------------------------------------------------- 复投接口
+@app.post("/api/assessments/{aid}/resubmissions", status_code=201)
+def create_resubmission(aid: str, payload: ResubmissionIn,
+                        store: Store = Depends(get_store)):
+    """被拒收的来料返工后重新进场。
+
+    操作员凭当前有效（链尾）且结论仍为“拒收”的判定单提交新批次编号、
+    复投重量、物料污染量与操作者；系统沿用来源区域，按提交时该区域的
+    启用规则出具一张**独立判定单**（新批次、新修订链），记录来源链与
+    复投轮次。旧判定单与已生成结算单保持原样。每条被拒收链最多一次
+    直接复投；复投仍被拒收时，可对新链尾继续下一轮复投。
+    来源不存在、不是链尾、已不再拒收、编号冲突或并发重复复投时，
+    拒绝整笔操作且不写判定或审计。"""
+    src = store.get_assessment(aid)
+    if not src:
+        return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
+    if not src["is_current"]:
+        chain = store.get_chain(aid)
+        tail_id = chain[-1]["id"] if chain else aid
+        return _err([{"field": "id",
+                      "message": f"来源单号 {aid} 不是当前有效版本（链尾），"
+                                 f"当前链尾为 {tail_id}，请凭链尾判定单复投"}],
+                    409)
+    if src["conclusion"] != "拒收":
+        return _err([{"field": "id",
+                      "message": f"来源单号 {aid} 的当前结论为"
+                                 f"“{src['conclusion']}”，仅结论为“拒收”的"
+                                 f"判定单可返工复投"}], 409)
+    # 沿用来源区域；按提交时该区域的启用规则出具独立判定单
+    rule, err = _resolve_rule(store, src["region"], None)
+    if err:
+        return _err([{"field": "region",
+                      "message": f"来源区域 {src['region']} 当前没有可用于"
+                                 f"出具判定的启用规则版本，请联系管理员"}], 409)
+    materials = [m.model_dump() for m in payload.materials]
+    errors = engine.validate_submission(rule, payload.weight_kg, materials)
+    if errors:
+        return _err(errors)
+    result = engine.evaluate(rule, payload.weight_kg, materials)
+    round_no = (src["resub_round"] or 0) + 1
+    result["evidence"].insert(
+        0, f"本单为拒收返工后的第 {round_no} 轮复投，来源单号 {aid}"
+           f"（区域沿用 {src['region']}，按提交时启用规则 "
+           f"{rule['region']}/{rule['version']} 独立判定；旧判定与"
+           f"已生成结算单保持原样）。")
+    result["evidence"].append(f"复投操作者：{payload.operator}。")
+    stored = {
+        "batch_no": payload.batch_no,
+        "weight_kg": payload.weight_kg,
+        "materials": materials,
+        "operator": payload.operator,
+        "resubmission_of": aid,
+    }
+    rec, code = store.create_resubmission(aid, stored, rule, result)
+    if code == "not_found":
+        return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
+    if code == "not_tail":
+        chain = store.get_chain(aid)
+        tail_id = chain[-1]["id"] if chain else aid
+        return _err([{"field": "id",
+                      "message": f"复投冲突：来源单号 {aid} 已不是链尾，"
+                                 f"当前链尾为 {tail_id}，请获取最新单号后重试"}],
+                    409)
+    if code == "not_rejected":
+        return _err([{"field": "id",
+                      "message": "复投冲突：来源链尾的当前结论已不是“拒收”，"
+                                 "不能复投"}], 409)
+    if code == "already_resubmitted":
+        return _err([{"field": "id",
+                      "message": f"来源链 {src['root_id']} 已经直接复投过，"
+                                 f"每条被拒收链最多一次直接复投；如需继续"
+                                 f"返工，请凭最新一轮的拒收链尾复投"}], 409)
+    if code == "batch_conflict":
+        return _err([{"field": "batch_no",
+                      "message": f"区域 {src['region']} 已存在批次编号 "
+                                 f"{payload.batch_no} 的判定单，"
+                                 f"复投新批次编号不得与已有原单批次编号重复"}],
+                    409)
+    store.add_audit(payload.operator, "assessment.resubmitted", "assessment",
+                    rec["id"],
+                    {"source_assessment_id": aid,
+                     "source_chain_id": src["root_id"],
+                     "resub_root_id": rec["resub_root_id"],
+                     "resub_round": round_no,
+                     "batch_no": rec["batch_no"], "region": rec["region"],
+                     "rule_version": rule["version"],
+                     "level": result["level"]["code"],
+                     "conclusion": result["conclusion"],
+                     "total_fee": result["total_fee"]})
+    return rec
+
+
+@app.get("/api/assessments/{aid}/resubmissions")
+def list_resubmissions(aid: str, store: Store = Depends(get_store)):
+    """按复投谱系内任意单号（含原拒收链）查询完整复投谱系与最新轮。"""
+    lineage = store.get_resub_lineage(aid)
+    if not lineage:
+        return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
+    return lineage
 
 
 # ---------------------------------------------------------------- 复核接口
@@ -442,6 +556,8 @@ def export_assessments(region: str | None = None, level: str | None = None,
         "contamination_ratio", "level_code", "level_name", "conclusion",
         "total_fee", "currency", "rule_version", "operator", "created_at",
         "version", "is_current", "root_id", "parent_id", "revision_reason",
+        "resub_root_id", "resub_parent_id", "resub_round",
+        "resub_source_chain_id",
     ], "assessments.csv")
 
 
