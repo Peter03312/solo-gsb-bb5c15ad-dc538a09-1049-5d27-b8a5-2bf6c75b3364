@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS assessments (
     parent_id              TEXT,
     version                INTEGER NOT NULL DEFAULT 1,
     revision_reason        TEXT,
+    rework_source_id       TEXT,
+    rework_round           INTEGER NOT NULL DEFAULT 0,
     created_at             TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_assessments_batch  ON assessments(batch_no);
@@ -126,6 +128,11 @@ class Store:
                         " INTEGER NOT NULL DEFAULT 1"),
             ("revision_reason",
              "ALTER TABLE assessments ADD COLUMN revision_reason TEXT"),
+            ("rework_source_id",
+             "ALTER TABLE assessments ADD COLUMN rework_source_id TEXT"),
+            ("rework_round",
+             "ALTER TABLE assessments ADD COLUMN rework_round"
+             " INTEGER NOT NULL DEFAULT 0"),
         ):
             if col not in cols:
                 conn.execute(ddl)
@@ -332,8 +339,9 @@ class Store:
                 " total_contamination_kg, contamination_ratio, level_code,"
                 " level_name, conclusion, total_fee, currency, rule_version,"
                 " rule_snapshot, request_json, result_json, operator,"
-                " root_id, parent_id, version, revision_reason, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " root_id, parent_id, version, revision_reason,"
+                " rework_source_id, rework_round, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     aid, payload["batch_no"], payload["region"], payload["weight_kg"],
                     result["total_contamination_kg"], result["contamination_ratio"],
@@ -344,10 +352,115 @@ class Store:
                     json.dumps(result, ensure_ascii=False),
                     payload.get("operator"),
                     root_id, base_id, tail["version"] + 1,
-                    payload.get("reason"), _now(),
+                    payload.get("reason"),
+                    payload.get("rework_source_id"),
+                    payload.get("rework_round", 0), _now(),
                 ),
             )
         return self.get_assessment(aid), None
+
+    # ---------------------------------------------------------------- 复投
+    def create_rework(self, *, source_root_id: str, source_id: str,
+                      payload: dict, rule: dict, result: dict
+                      ) -> tuple[dict | None, str | None]:
+        """在单个持锁事务内复核复投条件并出具独立的复投判定单（新修订链）。
+
+        复核内容：来源仍为链尾、来源链尚未发起过直接复投、同区域新批次
+        编号不与已有原单（各链 v1）重复。返回 (新单, None)；失败返回
+        (None, 'not_tail' | 'already_reworked' | 'batch_conflict')，
+        失败时不产生任何写入。"""
+        aid = "A" + uuid.uuid4().hex[:10].upper()
+        with self._locked_conn() as conn:
+            tail = conn.execute(
+                "SELECT id FROM assessments"
+                " WHERE root_id=? OR id=? ORDER BY version DESC LIMIT 1",
+                (source_root_id, source_root_id),
+            ).fetchone()
+            if not tail or tail["id"] != source_id:
+                return None, "not_tail"
+            dup = conn.execute(
+                "SELECT 1 FROM assessments WHERE rework_source_id IN"
+                " (SELECT id FROM assessments WHERE root_id=? OR id=?)",
+                (source_root_id, source_root_id),
+            ).fetchone()
+            if dup:
+                return None, "already_reworked"
+            conflict = conn.execute(
+                "SELECT 1 FROM assessments WHERE region=? AND batch_no=?"
+                " AND parent_id IS NULL",
+                (payload["region"], payload["batch_no"]),
+            ).fetchone()
+            if conflict:
+                return None, "batch_conflict"
+            conn.execute(
+                "INSERT INTO assessments (id, batch_no, region, weight_kg,"
+                " total_contamination_kg, contamination_ratio, level_code,"
+                " level_name, conclusion, total_fee, currency, rule_version,"
+                " rule_snapshot, request_json, result_json, operator,"
+                " root_id, version, rework_source_id, rework_round, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    aid, payload["batch_no"], payload["region"],
+                    payload["weight_kg"],
+                    result["total_contamination_kg"], result["contamination_ratio"],
+                    result["level"]["code"], result["level"]["name"],
+                    result["conclusion"], result["total_fee"], result["currency"],
+                    rule["version"], json.dumps(rule, ensure_ascii=False),
+                    json.dumps(payload, ensure_ascii=False),
+                    json.dumps(result, ensure_ascii=False),
+                    payload.get("operator"),
+                    aid, 1, payload.get("rework_source_id"),
+                    payload.get("rework_round", 0), _now(),
+                ),
+            )
+        return self.get_assessment(aid), None
+
+    def get_rework_lineage(self, aid: str) -> dict | None:
+        """按谱系内任意单号解析完整复投谱系：先向来源方向回溯到谱系起点
+        （原单链），再沿直接复投链逐轮向前收集各轮的链根与当前链尾。
+        单号不存在时返回 None。"""
+        with self._locked_conn() as conn:
+            row = conn.execute("SELECT * FROM assessments WHERE id=?",
+                               (aid,)).fetchone()
+            if not row:
+                return None
+            root_id = row["root_id"] or row["id"]
+            while True:  # 当前链根若是复投单，跳到其来源所在链
+                root_row = conn.execute(
+                    "SELECT * FROM assessments WHERE id=?", (root_id,)).fetchone()
+                src = root_row["rework_source_id"] if root_row else None
+                if not src:
+                    break
+                src_row = conn.execute(
+                    "SELECT * FROM assessments WHERE id=?", (src,)).fetchone()
+                if not src_row:
+                    break
+                root_id = src_row["root_id"] or src_row["id"]
+            lineage_root = root_id
+            rounds: list[dict] = []
+            cur = lineage_root
+            while True:
+                members = conn.execute(
+                    "SELECT * FROM assessments WHERE root_id=? OR id=?"
+                    " ORDER BY version, created_at, id", (cur, cur)).fetchall()
+                root_row = next((r for r in members if r["id"] == cur),
+                                members[0])
+                nxt = conn.execute(
+                    "SELECT id FROM assessments WHERE rework_source_id IN"
+                    " (SELECT id FROM assessments WHERE root_id=? OR id=?)"
+                    " ORDER BY created_at, id LIMIT 1", (cur, cur)).fetchone()
+                rounds.append({
+                    "round": root_row["rework_round"],
+                    "root_id": cur,
+                    "rework_source_id": root_row["rework_source_id"],
+                    "root": dict(root_row),
+                    "tail": dict(members[-1]),
+                    "reworked": nxt is not None,
+                })
+                if not nxt:
+                    break
+                cur = nxt["id"]  # 复投单即新链链根（root_id 指向自身）
+        return {"lineage_root_id": lineage_root, "rounds": rounds}
 
     def get_assessment(self, aid: str) -> dict | None:
         with self._locked_conn() as conn:
@@ -384,6 +497,8 @@ class Store:
             "version": row["version"],
             "is_current": is_current,
             "revision_reason": row["revision_reason"],
+            "rework_source_id": row["rework_source_id"],
+            "rework_round": row["rework_round"],
         }
 
     def list_assessments(self, region: str | None = None, level: str | None = None,
@@ -393,6 +508,7 @@ class Store:
                " contamination_ratio, level_code, level_name, conclusion, total_fee,"
                " currency, rule_version, operator, created_at,"
                " root_id, parent_id, version, revision_reason,"
+               " rework_source_id, rework_round,"
                " NOT EXISTS(SELECT 1 FROM assessments c"
                "            WHERE c.parent_id = assessments.id) AS is_current"
                " FROM assessments")

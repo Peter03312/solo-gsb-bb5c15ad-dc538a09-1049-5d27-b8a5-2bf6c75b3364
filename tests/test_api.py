@@ -626,6 +626,365 @@ def test_review_missing_details_rejected(client, store):
     assert "缺少可重算明细" in r.json()["errors"][0]["message"]
 
 
+# ------------------------------------------------------------------ 拒收复投
+def rejected_one(client, **kw):
+    """出具一张结论为拒收的判定单（50kg 其他/100kg → C 级拒收）。"""
+    kw.setdefault("materials", [{"category": "其他", "contamination_kg": 50}])
+    return create_one(client, **kw)
+
+
+def rework_payload(**kw):
+    base = {
+        "batch_no": "B-REWORK-001",
+        "weight_kg": 90,
+        "materials": [{"category": "PET", "contamination_kg": 1}],
+        "operator": "返工员甲",
+    }
+    base.update(kw)
+    return base
+
+
+def test_rework_ok(client):
+    a1 = rejected_one(client)
+    assert a1["conclusion"] == "拒收"
+    assert a1["rework_round"] == 0
+    assert a1["rework_source_id"] is None
+
+    r = client.post(f"/api/assessments/{a1['id']}/reworks",
+                    json=rework_payload())
+    assert r.status_code == 201, r.text
+    d = r.json()
+    # 独立判定单：新修订链 v1，root 指向自身
+    assert d["id"] != a1["id"]
+    assert d["version"] == 1 and d["is_current"]
+    assert d["root_id"] == d["id"]
+    assert d["parent_id"] is None
+    # 沿用来源区域，记录来源链与复投轮次
+    assert d["region"] == a1["region"]
+    assert d["batch_no"] == "B-REWORK-001"
+    assert d["rework_source_id"] == a1["id"]
+    assert d["rework_round"] == 1
+    assert d["operator"] == "返工员甲"
+    # 按提交时启用规则判定：1kg/90kg ≈ 1.11% → A 级合格
+    assert d["rule_version"] == "v1.0"
+    assert d["conclusion"] == "合格接收"
+    assert d["total_fee"] == 0
+    assert any("复投" in e and a1["id"] in e for e in d["evidence"])
+
+    # 旧判定保持原样
+    old = client.get(f"/api/assessments/{a1['id']}").json()
+    assert old["conclusion"] == "拒收"
+    assert old["is_current"]
+    assert old["total_fee"] == a1["total_fee"]
+
+
+def test_rework_uses_active_rule_at_submission(client):
+    a1 = rejected_one(client)  # 按 v1.0 出具
+    assert a1["rule_version"] == "v1.0"
+    # 切换启用规则后再复投：按提交时的 v1.1 判定，而非来源单快照
+    r = client.post("/api/rules/default/activate", json={"version": "v1.1"})
+    assert r.status_code == 200
+
+    r = client.post(f"/api/assessments/{a1['id']}/reworks",
+                    json=rework_payload(materials=[{"category": "PET",
+                                                    "contamination_kg": 3}]))
+    assert r.status_code == 201
+    d = r.json()
+    assert d["rule_version"] == "v1.1"
+    assert d["total_fee"] == 4.5            # 3kg × 1.5（v1.0 下应为 3.6）
+    assert d["conclusion"] == "降级接收"
+    # 来源单仍固定为出具时的 v1.0 结论
+    old = client.get(f"/api/assessments/{a1['id']}").json()
+    assert old["rule_version"] == "v1.0"
+    assert old["conclusion"] == "拒收"
+
+
+def test_rework_source_not_found(client):
+    r = client.post("/api/assessments/NOPE/reworks", json=rework_payload())
+    assert r.status_code == 404
+    actions = [i["action"] for i in client.get("/api/audit").json()["items"]]
+    assert "assessment.reworked" not in actions
+
+
+def test_rework_source_not_tail(client):
+    a1 = rejected_one(client)
+    a2 = client.post(f"/api/assessments/{a1['id']}/revisions",
+                     json=revise_payload(a1["id"], weight_kg=100,
+                                         materials=[{"category": "其他",
+                                                     "contamination_kg": 50}]
+                                         )).json()
+    assert a2["conclusion"] == "拒收"
+    # 旧版本不是链尾，不能作为复投来源
+    r = client.post(f"/api/assessments/{a1['id']}/reworks",
+                    json=rework_payload())
+    assert r.status_code == 409
+    assert "链尾" in r.json()["errors"][0]["message"]
+    # 链尾仍拒收，可以正常复投
+    r = client.post(f"/api/assessments/{a2['id']}/reworks",
+                    json=rework_payload())
+    assert r.status_code == 201
+    assert r.json()["rework_source_id"] == a2["id"]
+
+
+def test_rework_source_not_rejected(client):
+    a1 = create_one(client)  # 降级接收
+    assert a1["conclusion"] == "降级接收"
+    r = client.post(f"/api/assessments/{a1['id']}/reworks",
+                    json=rework_payload())
+    assert r.status_code == 422
+    assert "拒收" in r.json()["errors"][0]["message"]
+    # 合格接收同样不可复投
+    a2 = create_one(client, batch_no="B-CLEAN",
+                    materials=[{"category": "PET", "contamination_kg": 1}])
+    assert a2["conclusion"] == "合格接收"
+    r = client.post(f"/api/assessments/{a2['id']}/reworks",
+                    json=rework_payload(batch_no="B-REWORK-002"))
+    assert r.status_code == 422
+
+
+def test_rework_batch_no_conflict(client):
+    a1 = rejected_one(client)  # 批次 B20261005-001（默认）
+    # 与区域内已有原单批次编号重复 → 409
+    r = client.post(f"/api/assessments/{a1['id']}/reworks",
+                    json=rework_payload(batch_no="B20261005-001"))
+    assert r.status_code == 409
+    assert "batch_no" in fields(r)
+    # 与其他区域的原单批次编号重复 → 允许（唯一性按区域判定）
+    create_one(client, batch_no="B-HD-01", region="华东",
+               materials=[{"category": "厨余", "contamination_kg": 10}])
+    r = client.post(f"/api/assessments/{a1['id']}/reworks",
+                    json=rework_payload(batch_no="B-HD-01"))
+    assert r.status_code == 201
+
+
+def test_rework_batch_no_conflicts_with_revised_chain(client):
+    a1 = create_one(client)  # 批次 B20261005-001，降级接收
+    client.post(f"/api/assessments/{a1['id']}/revisions",
+                json=revise_payload(a1["id"]))
+    a2 = rejected_one(client, batch_no="B-REJ-01")
+    # 目标批次编号属于另一条链的原单（即使该链已被修订）→ 冲突
+    r = client.post(f"/api/assessments/{a2['id']}/reworks",
+                    json=rework_payload(batch_no="B20261005-001"))
+    assert r.status_code == 409
+    assert "batch_no" in fields(r)
+
+
+def test_rework_once_per_chain(client):
+    a1 = rejected_one(client)
+    r1 = client.post(f"/api/assessments/{a1['id']}/reworks",
+                     json=rework_payload())
+    assert r1.status_code == 201
+    # 同一被拒收链不允许第二次直接复投
+    r2 = client.post(f"/api/assessments/{a1['id']}/reworks",
+                     json=rework_payload(batch_no="B-REWORK-002"))
+    assert r2.status_code == 409
+    assert "复投" in r2.json()["errors"][0]["message"]
+    # 失败不产生单据与审计
+    assert len(client.get("/api/assessments").json()["items"]) == 2
+    actions = [i["action"] for i in client.get("/api/audit").json()["items"]]
+    assert actions.count("assessment.reworked") == 1
+
+
+def test_rework_next_round_when_rejected_again(client):
+    a1 = rejected_one(client)
+    # 第一轮复投仍被拒收（50kg/90kg ≈ 55.6% → C 级）
+    r1 = client.post(f"/api/assessments/{a1['id']}/reworks",
+                     json=rework_payload(
+                         materials=[{"category": "其他",
+                                     "contamination_kg": 50}]))
+    assert r1.status_code == 201
+    b1 = r1.json()
+    assert b1["conclusion"] == "拒收"
+    assert b1["rework_round"] == 1
+    # 凭新一轮拒收判定单继续下一轮复投
+    r2 = client.post(f"/api/assessments/{b1['id']}/reworks",
+                     json=rework_payload(batch_no="B-REWORK-002"))
+    assert r2.status_code == 201, r2.text
+    c1 = r2.json()
+    assert c1["rework_round"] == 2
+    assert c1["rework_source_id"] == b1["id"]
+    assert c1["root_id"] == c1["id"]
+    assert c1["conclusion"] == "合格接收"
+
+
+def test_rework_lineage_query(client):
+    a1 = rejected_one(client)
+    b1 = client.post(f"/api/assessments/{a1['id']}/reworks",
+                     json=rework_payload(
+                         materials=[{"category": "其他",
+                                     "contamination_kg": 50}])).json()
+    c1 = client.post(f"/api/assessments/{b1['id']}/reworks",
+                     json=rework_payload(batch_no="B-REWORK-002")).json()
+
+    # 从任一轮（含链内任意单号）可查完整谱系与最新轮
+    for aid in (a1["id"], b1["id"], c1["id"]):
+        r = client.get(f"/api/assessments/{aid}/reworks")
+        assert r.status_code == 200
+        d = r.json()
+        assert d["lineage_root_id"] == a1["id"]
+        assert d["latest_round"] == 2
+        assert d["latest_id"] == c1["id"]
+        assert [rd["round"] for rd in d["rounds"]] == [0, 1, 2]
+        assert [rd["root_id"] for rd in d["rounds"]] == [a1["id"], b1["id"],
+                                                         c1["id"]]
+        assert d["rounds"][0]["conclusion"] == "拒收"
+        assert d["rounds"][1]["conclusion"] == "拒收"
+        assert d["rounds"][2]["conclusion"] == "合格接收"
+        assert d["rounds"][0]["rework_source_id"] is None
+        assert d["rounds"][1]["rework_source_id"] == a1["id"]
+        assert d["rounds"][2]["rework_source_id"] == b1["id"]
+        assert d["rounds"][0]["reworked"] is True
+        assert d["rounds"][2]["reworked"] is False
+        assert d["latest"]["current_id"] == c1["id"]
+        assert d["latest"]["conclusion"] == "合格接收"
+
+    # 来源链被修订后，谱系中该轮展示当前链尾
+    a2 = client.post(f"/api/assessments/{a1['id']}/revisions",
+                     json=revise_payload(a1["id"], weight_kg=100,
+                                         materials=[{"category": "其他",
+                                                     "contamination_kg": 60}]
+                                         )).json()
+    r = client.get(f"/api/assessments/{a2['id']}/reworks")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["lineage_root_id"] == a1["id"]
+    assert d["rounds"][0]["current_id"] == a2["id"]
+    assert d["rounds"][0]["conclusion"] == "拒收"
+    assert d["latest_round"] == 2
+
+    r = client.get("/api/assessments/NOPE/reworks")
+    assert r.status_code == 404
+
+
+def test_rework_concurrent_single_winner(client):
+    import concurrent.futures
+
+    a1 = rejected_one(client)
+
+    def do_rework(i):
+        return client.post(f"/api/assessments/{a1['id']}/reworks",
+                           json=rework_payload(batch_no=f"B-REWORK-C{i}"))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        codes = [f.result().status_code for f in
+                 [pool.submit(do_rework, i) for i in range(4)]]
+    assert codes.count(201) == 1
+    assert codes.count(409) == 3
+    # 只生成一张复投单：原链尾 + 一张复投链尾
+    current = client.get("/api/assessments",
+                         params={"current": "true"}).json()["items"]
+    assert len(current) == 2
+    actions = [i["action"] for i in client.get("/api/audit").json()["items"]]
+    assert actions.count("assessment.reworked") == 1
+
+
+def test_rework_failure_no_side_effects(client):
+    a1 = rejected_one(client)
+    ok = create_one(client, batch_no="B-OK")  # 非拒收
+    before_audit = len(client.get("/api/audit").json()["items"])
+    before_docs = len(client.get("/api/assessments").json()["items"])
+
+    # 来源不存在 / 未拒收 / 编号冲突 / 字段错误 / 缺操作者
+    assert client.post("/api/assessments/NOPE/reworks",
+                       json=rework_payload()).status_code == 404
+    assert client.post(f"/api/assessments/{ok['id']}/reworks",
+                       json=rework_payload()).status_code == 422
+    assert client.post(f"/api/assessments/{a1['id']}/reworks",
+                       json=rework_payload(batch_no="B-OK")).status_code == 409
+    assert client.post(f"/api/assessments/{a1['id']}/reworks",
+                       json=rework_payload(weight_kg=-1)).status_code == 422
+    assert client.post(f"/api/assessments/{a1['id']}/reworks",
+                       json=rework_payload(operator="")).status_code == 422
+
+    # 各类失败均不产生判定单与审计
+    assert len(client.get("/api/assessments").json()["items"]) == before_docs
+    assert len(client.get("/api/audit").json()["items"]) == before_audit
+    # 失败不占用来源链：修正后仍可正常复投
+    r = client.post(f"/api/assessments/{a1['id']}/reworks",
+                    json=rework_payload())
+    assert r.status_code == 201
+
+
+def test_rework_audit_trail(client):
+    a1 = rejected_one(client)
+    r = client.post(f"/api/assessments/{a1['id']}/reworks",
+                    json=rework_payload())
+    rid = r.json()["id"]
+    items = client.get("/api/audit",
+                       params={"entity": "assessment"}).json()["items"]
+    recs = [i for i in items if i["action"] == "assessment.reworked"]
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["actor"] == "返工员甲"
+    assert rec["entity_id"] == rid
+    import json as _json
+    detail = _json.loads(rec["detail"])
+    assert detail["source_id"] == a1["id"]
+    assert detail["source_root_id"] == a1["id"]
+    assert detail["rework_round"] == 1
+    assert detail["batch_no"] == "B-REWORK-001"
+    assert detail["region"] == "default"
+    assert detail["conclusion"] == "合格接收"
+
+
+def test_rework_chain_independent_revision_and_settlement(client):
+    a1 = rejected_one(client)  # 拒收扣费 50 × 1.5 × 1.5 = 112.5
+    s1 = settle(client, [a1["id"]], request_id="REQ-RW1").json()
+    assert s1["total_delta"] == 112.5
+
+    b1 = client.post(f"/api/assessments/{a1['id']}/reworks",
+                     json=rework_payload(
+                         materials=[{"category": "PET",
+                                     "contamination_kg": 3}])).json()
+    assert b1["total_fee"] == 3.6
+    # 复投链独立：可修订（继承轮次与来源）、可结算
+    b2 = client.post(f"/api/assessments/{b1['id']}/revisions",
+                     json=revise_payload(b1["id"], weight_kg=90,
+                                         materials=[{"category": "PET",
+                                                     "contamination_kg": 2}]
+                                         )).json()
+    assert b2["root_id"] == b1["id"]
+    assert b2["rework_round"] == 1
+    assert b2["rework_source_id"] == a1["id"]
+    s2 = settle(client, [b2["id"]], request_id="REQ-RW2").json()
+    assert s2["items"][0]["root_id"] == b1["id"]
+    assert s2["items"][0]["delta"] == 2.4
+
+    # 旧判定与已生成结算单保持原样
+    old = client.get(f"/api/settlements/{s1['id']}").json()
+    assert old["total_delta"] == 112.5
+    old_a1 = client.get(f"/api/assessments/{a1['id']}").json()
+    assert old_a1["conclusion"] == "拒收"
+    assert old_a1["total_fee"] == 112.5
+    # 谱系仍完整可查
+    lin = client.get(f"/api/assessments/{a1['id']}/reworks").json()
+    assert lin["latest_round"] == 1
+    assert lin["rounds"][1]["current_id"] == b2["id"]
+
+
+def test_rework_list_and_csv_fields(client):
+    a1 = rejected_one(client)
+    client.post(f"/api/assessments/{a1['id']}/reworks", json=rework_payload())
+
+    items = client.get("/api/assessments").json()["items"]
+    assert len(items) == 2
+    for it in items:
+        # 既有字段保持，新增复投字段
+        for f in ("id", "batch_no", "region", "conclusion", "total_fee",
+                  "version", "is_current", "root_id"):
+            assert f in it
+        assert "rework_round" in it and "rework_source_id" in it
+    by_batch = {it["batch_no"]: it for it in items}
+    assert by_batch["B-REWORK-001"]["rework_round"] == 1
+    assert by_batch["B20261005-001"]["rework_round"] == 0
+
+    r = client.get("/api/export/assessments.csv")
+    assert r.status_code == 200
+    header = r.text.splitlines()[0]
+    assert header.startswith("﻿id,batch_no,region,weight_kg")
+    assert "rework_round" in header and "rework_source_id" in header
+
+
 # ------------------------------------------------------------------ 费用结算
 def settle(client, ids, **kw):
     payload = {"region": "default", "assessment_ids": ids,

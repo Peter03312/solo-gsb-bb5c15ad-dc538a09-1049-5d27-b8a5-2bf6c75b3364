@@ -70,6 +70,15 @@ class ReviewIn(BaseModel):
     region: str | None = Field(default=None, max_length=32)
 
 
+class ReworkIn(BaseModel):
+    """复投提交：新批次编号、复投重量、物料污染量与操作者；
+    区域沿用来源判定单，规则取提交时该区域的启用版本。"""
+    batch_no: str = Field(min_length=1, max_length=64)
+    weight_kg: float
+    materials: list[MaterialItem] = Field(min_length=1)
+    operator: str = Field(min_length=1, max_length=32)
+
+
 class SettlementIn(BaseModel):
     """结算提交：区域、当前有效（链尾）单号列表与幂等请求号。"""
     region: str = Field(min_length=1, max_length=32)
@@ -235,6 +244,8 @@ def create_revision(aid: str, payload: RevisionIn,
         "weight_kg": payload.weight_kg, "materials": materials,
         "operator": payload.operator, "reason": payload.reason,
         "base_id": payload.base_id,
+        "rework_source_id": root["rework_source_id"],
+        "rework_round": root["rework_round"],
     }
     rec, err = store.create_revision(root["root_id"] or root["id"],
                                      payload.base_id, stored, rule, result)
@@ -350,6 +361,116 @@ def review_assessment(aid: str, payload: ReviewIn,
     }
 
 
+# ---------------------------------------------------------------- 复投接口
+def _rework_not_tail_err(aid: str, tail_id: str) -> JSONResponse:
+    return _err([{"field": "id",
+                  "message": f"复投冲突：来源单号 {aid} 不是修订链当前有效版本，"
+                             f"当前链尾为 {tail_id}，请凭最新判定单发起复投"}], 409)
+
+
+@app.post("/api/assessments/{aid}/reworks", status_code=201)
+def create_rework(aid: str, payload: ReworkIn, store: Store = Depends(get_store)):
+    """被拒收来料返工后重新进场：凭当前有效（链尾）且结论为「拒收」的判定单，
+    沿用来源区域、按提交时该区域启用规则出具独立判定单（新修订链），
+    记录来源链与复投轮次。每条被拒收链最多一次直接复投；同区域新批次
+    编号不得与已有原单重复。任何校验失败或并发冲突都不产生单据与审计。"""
+    chain = store.get_chain(aid)
+    if not chain:
+        return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
+    root, tail = chain[0], chain[-1]
+    if aid != tail["id"]:
+        return _rework_not_tail_err(aid, tail["id"])
+    if tail["conclusion"] != "拒收":
+        return _err([{"field": "id",
+                      "message": f"来源判定单当前结论为「{tail['conclusion']}」，"
+                                 f"仅结论为「拒收」的判定单可发起复投"}])
+    # 复投按提交时该区域的启用规则判定，不沿用来源单的规则快照
+    region = tail["region"]
+    rule, err = _resolve_rule(store, region, None)
+    if err:
+        return _err([err])
+    materials = [m.model_dump() for m in payload.materials]
+    errors = engine.validate_submission(rule, payload.weight_kg, materials)
+    if errors:
+        return _err(errors)
+    round_no = (tail["rework_round"] or 0) + 1
+    result = engine.evaluate(rule, payload.weight_kg, materials)
+    result["evidence"].insert(
+        0, f"本单为第 {round_no} 轮复投判定：来源判定单 {tail['id']}"
+           f"（批次 {tail['batch_no']}，结论拒收，返工后重新进场），"
+           f"沿用来源区域 {region}，按提交时启用规则 "
+           f"{region}/{rule['version']} 独立判定。")
+    stored = {
+        "batch_no": payload.batch_no, "region": region,
+        "weight_kg": payload.weight_kg, "materials": materials,
+        "operator": payload.operator,
+        "rework_source_id": tail["id"], "rework_round": round_no,
+    }
+    rec, err_code = store.create_rework(
+        source_root_id=root["root_id"] or root["id"], source_id=tail["id"],
+        payload=stored, rule=rule, result=result)
+    if err_code == "not_tail":
+        # 并发修订改变了链尾：本请求未被接受，不产生单据与审计
+        fresh = store.get_chain(aid)
+        return _rework_not_tail_err(aid, fresh[-1]["id"] if fresh else tail["id"])
+    if err_code == "already_reworked":
+        return _err([{"field": "id",
+                      "message": "该被拒收链已发起过直接复投，每条被拒收链最多"
+                                 "一次直接复投；复投仍被拒收时，请凭最新一轮的"
+                                 "拒收判定单继续下一轮复投"}], 409)
+    if err_code == "batch_conflict":
+        return _err([{"field": "batch_no",
+                      "message": f"批次编号冲突：区域 {region} 已存在批次编号为 "
+                                 f"{payload.batch_no} 的原单，复投须使用"
+                                 f"新的批次编号"}], 409)
+    store.add_audit(payload.operator, "assessment.reworked", "assessment",
+                    rec["id"],
+                    {"source_id": tail["id"],
+                     "source_root_id": root["root_id"] or root["id"],
+                     "rework_round": round_no,
+                     "batch_no": payload.batch_no, "region": region,
+                     "rule_version": rule["version"],
+                     "level": result["level"]["code"],
+                     "conclusion": result["conclusion"],
+                     "total_fee": result["total_fee"]})
+    return rec
+
+
+@app.get("/api/assessments/{aid}/reworks")
+def get_rework_lineage(aid: str, store: Store = Depends(get_store)):
+    """按谱系内任意单号查询完整复投谱系与最新一轮：每轮给出该链当前有效
+    （链尾）结论、来源单号与是否已发起直接复投。"""
+    lineage = store.get_rework_lineage(aid)
+    if not lineage:
+        return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
+    rounds = [{
+        "round": rd["round"],
+        "root_id": rd["root_id"],
+        "current_id": rd["tail"]["id"],
+        "batch_no": rd["tail"]["batch_no"],
+        "region": rd["tail"]["region"],
+        "weight_kg": rd["tail"]["weight_kg"],
+        "total_contamination_kg": rd["tail"]["total_contamination_kg"],
+        "contamination_ratio": rd["tail"]["contamination_ratio"],
+        "level_code": rd["tail"]["level_code"],
+        "level_name": rd["tail"]["level_name"],
+        "conclusion": rd["tail"]["conclusion"],
+        "total_fee": rd["tail"]["total_fee"],
+        "currency": rd["tail"]["currency"],
+        "rule_version": rd["tail"]["rule_version"],
+        "version": rd["tail"]["version"],
+        "rework_source_id": rd["rework_source_id"],
+        "reworked": rd["reworked"],
+        "operator": rd["tail"]["operator"],
+        "created_at": rd["tail"]["created_at"],
+    } for rd in lineage["rounds"]]
+    return {"lineage_root_id": lineage["lineage_root_id"],
+            "latest_round": rounds[-1]["round"],
+            "latest_id": rounds[-1]["current_id"],
+            "latest": rounds[-1],
+            "rounds": rounds}
+
+
 # ---------------------------------------------------------------- 结算接口
 def _settlement_hash(region: str, assessment_ids: list[str],
                      operator: str | None) -> str:
@@ -442,6 +563,7 @@ def export_assessments(region: str | None = None, level: str | None = None,
         "contamination_ratio", "level_code", "level_name", "conclusion",
         "total_fee", "currency", "rule_version", "operator", "created_at",
         "version", "is_current", "root_id", "parent_id", "revision_reason",
+        "rework_round", "rework_source_id",
     ], "assessments.csv")
 
 

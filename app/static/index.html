@@ -87,6 +87,14 @@
         <button class="ghost" type="button" onclick="cancelRevision()">取消修订</button>
       </div>
     </div>
+    <div class="revbox" id="rewBox" style="background:#e8f0fd;border-color:#a8c4e8">
+      <b>复投模式</b>：被拒收批次返工后重新进场，正以来源判定单
+      <code id="rewBase"></code> 发起复投，沿用来源区域、按当前启用规则
+      独立判定。请填写<b>新批次编号</b>（不得与区域内已有原单重复）。
+      <div class="actions">
+        <button class="ghost" type="button" onclick="cancelRework()">取消复投</button>
+      </div>
+    </div>
     <div class="actions">
       <button id="submitBtn" onclick="submitForm()">提交判定</button>
       <span class="muted" id="ruleHint"></span>
@@ -122,6 +130,7 @@
 let RULES = {};  // region -> active rule
 let CUR = null;  // 当前展示的判定单详情
 let REV = null;  // 修订模式：{root_id, base_id}
+let REW = null;  // 复投模式：{source_id}
 
 async function loadRules() {
   const res = await fetch('/api/rules');
@@ -144,7 +153,7 @@ async function loadRules() {
 }
 
 function updateRuleHint() {
-  if (REV) return;
+  if (REV || REW) return;
   const rule = RULES[document.getElementById('region').value];
   document.getElementById('ruleHint').textContent =
     rule ? `当前启用规则版本：${rule.version}` : '';
@@ -172,8 +181,19 @@ function showErrors(errors) {
     '</ul>';
 }
 
+function resetMode() {
+  REV = null; REW = null;
+  document.getElementById('batch_no').disabled = false;
+  document.getElementById('region').disabled = false;
+  document.getElementById('revBox').style.display = 'none';
+  document.getElementById('rewBox').style.display = 'none';
+  document.getElementById('submitBtn').textContent = '提交判定';
+  updateRuleHint();
+}
+
 function startRevision() {
   if (!CUR || !CUR.is_current) return;
+  resetMode();
   REV = { root_id: CUR.root_id, base_id: CUR.id };
   document.getElementById('batch_no').value = CUR.batch_no;
   document.getElementById('batch_no').disabled = true;
@@ -200,14 +220,37 @@ function startRevision() {
   window.scrollTo({top: 0, behavior: 'smooth'});
 }
 
-function cancelRevision() {
-  REV = null;
-  document.getElementById('batch_no').disabled = false;
-  document.getElementById('region').disabled = false;
-  document.getElementById('revBox').style.display = 'none';
-  document.getElementById('submitBtn').textContent = '提交判定';
-  updateRuleHint();
+function cancelRevision() { resetMode(); }
+
+function startRework() {
+  if (!CUR || !CUR.is_current || CUR.conclusion !== '拒收') return;
+  resetMode();
+  REW = { source_id: CUR.id };
+  document.getElementById('batch_no').value = '';   // 新批次编号必填
+  document.getElementById('region').disabled = true; // 区域沿用来源单
+  document.getElementById('weight_kg').value = CUR.weight_kg;
+  document.getElementById('operator').value = '';
+  // 复投按提交时启用规则判定：物料类别取自当前启用规则
+  const cats = Object.keys((RULES[CUR.region] || {}).categories || {});
+  const mats = document.getElementById('materials');
+  mats.innerHTML = '';
+  for (const m of CUR.materials) {
+    addMatRow(cats);
+    const row = mats.lastElementChild;
+    row.querySelector('.cat').value = m.category;
+    row.querySelector('.cont').value = m.contamination_kg;
+  }
+  document.getElementById('rewBase').textContent =
+    `${CUR.id}（${CUR.batch_no}）`;
+  document.getElementById('rewBox').style.display = 'block';
+  document.getElementById('submitBtn').textContent = '提交复投';
+  const rule = RULES[CUR.region];
+  document.getElementById('ruleHint').textContent =
+    rule ? `复投按当前启用规则：${CUR.region}/${rule.version}` : '';
+  window.scrollTo({top: 0, behavior: 'smooth'});
 }
+
+function cancelRework() { resetMode(); }
 
 async function submitForm() {
   document.getElementById('errors').style.display = 'none';
@@ -226,6 +269,11 @@ async function submitForm() {
     url = `/api/assessments/${REV.root_id}/revisions`;
     body.base_id = REV.base_id;
     body.reason = document.getElementById('revReason').value.trim();
+    body.operator = op;
+  } else if (REW) {
+    // 复投：区域沿用来源单，按提交时启用规则独立判定，需新批次编号与操作者
+    url = `/api/assessments/${REW.source_id}/reworks`;
+    body.batch_no = document.getElementById('batch_no').value.trim();
     body.operator = op;
   } else {
     body.batch_no = document.getElementById('batch_no').value.trim();
@@ -246,13 +294,13 @@ async function submitForm() {
       if (res.status === 409 && REV) {
         // 尾版已被他人修订：刷新到链尾结论
         const rootId = REV.root_id;
-        cancelRevision();
+        resetMode();
         const c = await fetch(`/api/assessments/${rootId}/revisions`);
         if (c.ok) showDetail((await c.json()).current_id);
       }
       return;
     }
-    cancelRevision();
+    resetMode();
     renderResult(data);
     loadRecent();
   } finally {
@@ -274,6 +322,7 @@ async function renderResult(d) {
       <span style="margin-left:8px">${vtag}</span>
     </p>
     ${d.revision_reason ? `<p class="muted">修订原因：${d.revision_reason}</p>` : ''}
+    ${d.rework_round ? `<p class="muted">第 ${d.rework_round} 轮复投（来源判定单 ${d.rework_source_id}）</p>` : ''}
     <table>
       <tr><th>判定单号</th><td>${d.id}</td><th>批次</th><td>${d.batch_no}</td></tr>
       <tr><th>规则版本</th><td>${d.region}/${d.rule_version}</td>
@@ -282,8 +331,10 @@ async function renderResult(d) {
           <th>操作者</th><td>${d.operator || '—'}</td></tr>` : ''}
     </table>
     <div class="chain" id="chainBox"></div>
+    <div class="chain" id="reworkBox"></div>
     <div class="actions">
       ${d.is_current ? '<button class="ghost" type="button" onclick="startRevision()">发起修订</button>' : ''}
+      ${d.is_current && d.conclusion === '拒收' ? '<button class="ghost" type="button" onclick="startRework()">发起复投</button>' : ''}
     </div>
     <h2 style="margin-top:14px">扣费明细（合计 ${d.total_fee.toFixed(2)} ${d.currency}）</h2>
     <table>
@@ -308,6 +359,20 @@ async function renderResult(d) {
           title="${it.conclusion} / ${it.created_at}">v${it.version}</a>`
     ).join('<span class="sep">→</span>') +
     ` <span class="muted">当前有效：${chain.current.conclusion}（${chain.current_id}）</span>`;
+  // 复投谱系：任一轮可查完整谱系与最新轮
+  const rw = await fetch(`/api/assessments/${d.id}/reworks`);
+  const box = document.getElementById('reworkBox');
+  if (!rw.ok) { box.innerHTML = ''; return; }
+  const lin = await rw.json();
+  box.innerHTML = lin.rounds.length > 1
+    ? `<b>复投谱系</b>（共 ${lin.rounds.length} 轮）：` +
+      lin.rounds.map(rd =>
+        `<a class="${rd.current_id === lin.latest_id ? 'cur' : ''}"
+            onclick="showDetail('${rd.current_id}')"
+            title="${rd.conclusion} / ${rd.created_at}">${rd.round === 0 ? '原判' : '复投' + rd.round}</a>`
+      ).join('<span class="sep">→</span>') +
+      ` <span class="muted">最新轮（第 ${lin.latest_round} 轮）：${lin.latest.conclusion}（${lin.latest_id}）</span>`
+    : '';
 }
 
 async function loadRecent() {
@@ -335,7 +400,7 @@ async function showDetail(id) {
 }
 
 document.getElementById('region').addEventListener('change', () => {
-  if (REV) return;
+  if (REV || REW) return;
   updateRuleHint();
   document.getElementById('materials').innerHTML = '';
   addMatRow();
